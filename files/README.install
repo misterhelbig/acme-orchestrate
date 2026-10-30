@@ -1,0 +1,346 @@
+CME ORCHESTRATE - FREEBSD INSTALLATION
+=====================================
+
+Project: https://github.com/misterhelbig/acme-orchestrate
+
+This package installs the ACME orchestration scripts, DNS plugin,
+sample configurations, documentation and newsyslog configuration.
+
+It does not configure DNS credentials, certificate definitions, cron,
+SSH authentication or production certificate state.
+
+Prerequisites
+-------------
+- FreeBSD 15.
+- acme.sh, bind-tools and rsync (installed as package dependencies).
+- A dedicated acme user and group, normally created by the FreeBSD
+  acme.sh package.
+- An authoritative DNS zone accepting authenticated RFC 2136 updates.
+- A TSIG key authorised to update the challenge zone.
+- Public ACME DNS-01 CNAME delegation for each managed DNS name.
+- Dedicated local or remote directories for certificate deployment.
+- SSH authentication where remote replicas are configured.
+
+Installation
+------------
+Install the downloaded FreeBSD package as root:
+
+  pkg install ./acme-orchestrate-<version>.pkg
+
+Verify:
+
+  pkg info acme-orchestrate
+  pkg check -s acme-orchestrate
+  id acme
+
+The acme user must have write access to its state and account files.
+
+Production state is maintained under:
+
+  /var/db/acme/
+  /var/db/acme/.acme.sh/
+  /var/db/acme/certs/
+  /var/db/acme/deployment/
+
+Ensure the state directory and certificate home exist with suitable
+ownership and permissions before the first reconciliation.
+
+For example, as root:
+
+  install -d -o acme -g acme -m 700 /var/db/acme
+  install -d -o acme -g acme -m 700 /var/db/acme/.acme.sh
+  install -d -o acme -g acme -m 700 /var/db/acme/certs
+
+The orchestrator maintains its own deployment snapshots and inventory.
+
+Certificate configuration
+-------------------------
+Copy the packaged example:
+
+  /usr/local/etc/acme/domains.conf.sample
+
+to:
+
+  /usr/local/etc/acme/domains.conf
+
+Edit the file to describe certificate bundles and replica sets.
+
+Configuration format:
+
+  $alias = destination
+
+  parent-domain: challenge-alias: replicas: apex: SANs
+
+Example:
+
+  $web = root@webserver:/usr/local/etc/ssl/acme/
+  $local = /usr/local/etc/ssl/acme/
+
+  bar.net: bar-net: $web,$local: apex: *
+  bar.net: vpn-bar-net: $local: none: vpn
+
+The first definition requests one certificate for bar.net and
+*.bar.net, and assigns it to both replica sets.
+
+The second requests a certificate for vpn.bar.net.
+
+Each challenge alias must be unique. Every certificate must reference
+at least one defined replica alias.
+
+Replica destinations must be dedicated directories. The push command
+uses rsync --delete and may remove files not present in its snapshot.
+
+Challenge zone configuration
+----------------------------
+The package installs:
+
+  /usr/local/etc/acme/orchestrate.conf.sample
+
+On a fresh installation, the FreeBSD package @sample mechanism also
+creates:
+
+  /usr/local/etc/acme/orchestrate.conf
+
+Configure the authoritative DNS challenge zone:
+
+  ACME_CHALLENGE_ZONE='acme.example.net'
+
+Replace the example domain with the actual authoritative zone used
+for delegated ACME DNS-01 challenges.
+
+This setting controls the DNS challenge aliases constructed and
+validated by acme-orchestrate.
+
+IMPORTANT: The DNS plugin independently uses NSUPDATE_ZONE.
+
+  ACME_CHALLENGE_ZONE and NSUPDATE_ZONE must identify the same zone.
+
+Changing orchestrate.conf does not automatically update the plugin's
+saved account configuration.
+
+DNS plugin installation
+-----------------------
+The package installs the plugin at:
+
+  /usr/local/share/acme-orchestrate/dns_nsupdate.sh
+
+It must be accessible from the dnsapi directory in the acme.sh home
+used by the orchestrator.
+
+For example:
+
+  /var/db/acme/.acme.sh/dnsapi/dns_nsupdate.sh
+
+A symbolic link to the packaged copy is recommended so that future
+package upgrades also update the active plugin.
+
+As root, on a fresh installation:
+
+  install -d -o acme -g acme -m 700 /var/db/acme/.acme.sh/dnsapi
+
+  ln -s /usr/local/share/acme-orchestrate/dns_nsupdate.sh 
+    /var/db/acme/.acme.sh/dnsapi/dns_nsupdate.sh
+
+Check for an existing file or link before creating this link on an
+established installation.
+
+The staging acme.sh home must also have access to the plugin when
+staging issuance is required.
+
+Initial nsupdate configuration
+------------------------------
+The plugin uses these environment variables:
+
+  NSUPDATE_SERVER       Authoritative DNS server address(es)
+  NSUPDATE_SERVER_PORT  DNS update port (normally 53)
+  NSUPDATE_KEY          Absolute path to the TSIG key file
+  NSUPDATE_ZONE         Authoritative zone to update
+  NSUPDATE_OPT          Additional nsupdate options (optional)
+
+Example for an acme user using tcsh:
+
+  setenv NSUPDATE_SERVER 192.0.2.1
+  setenv NSUPDATE_SERVER_PORT 53
+  setenv NSUPDATE_KEY /var/db/acme/.acme.sh/acme-update.key
+  setenv NSUPDATE_ZONE acme.example.net
+  setenv NSUPDATE_OPT ""
+
+192.0.2.1 and acme.example.net are documentation examples.
+
+The TSIG key file must be provisioned independently. It must be
+readable by acme and protected against access by other users.
+
+The DNS server must be configured to authorise updates using the
+corresponding TSIG key.
+
+These NSUPDATE_* environment variables are required when the plugin
+first processes a DNS challenge.
+
+The plugin persists them using acme.sh's account configuration,
+saving entries named:
+
+  SAVED_NSUPDATE_SERVER
+  SAVED_NSUPDATE_SERVER_PORT
+  SAVED_NSUPDATE_KEY
+  SAVED_NSUPDATE_ZONE
+  SAVED_NSUPDATE_OPT
+
+Future invocations normally retrieve the persisted values. The
+environment variables are not required in scheduled cron jobs.
+
+Production and staging have separate acme.sh account configurations.
+They therefore require separate initialisation.
+
+A dry-run does not initialise the DNS plugin, because it does not
+perform live DNS updates.
+
+Do not publish TSIG key contents or ACME account credentials.
+
+DNS delegation
+--------------
+Each managed certificate name requires public DNS-01 delegation into
+the configured challenge zone.
+
+For example:
+
+  _acme-challenge.bar.net. IN CNAME _acme-challenge.bar-net.acme.example.net.
+
+The challenge alias "bar-net" must agree with domains.conf.
+
+For a wildcard certificate covering bar.net and *.bar.net, the
+same _acme-challenge.bar.net name is used for DNS-01 validation.
+
+Verify the CNAME before issuing:
+
+  dig _acme-challenge.bar.net CNAME +short
+
+The authoritative challenge zone must make dynamically created TXT
+records publicly resolvable.
+
+Initial reconciliation
+----------------------
+Run as the acme user:
+
+  /usr/local/sbin/acme-orchestrate --dry-run
+
+Review certificate changes, SANs, planned replica snapshots and
+housekeeping actions.
+
+After confirming configuration and DNS delegation, perform a live run
+with the initial NSUPDATE_* environment variables available:
+
+  /usr/local/sbin/acme-orchestrate
+
+Verify successful certificate issuance and snapshot publication.
+
+After the first DNS challenge, check that SAVED_NSUPDATE_* entries
+were written to the applicable acme.sh account.conf.
+
+Use the staging environment for controlled issuance tests where
+appropriate.
+
+Do not enable scheduled jobs until initial configuration is validated.
+
+Deployment
+----------
+Run as root.
+
+Preview:
+
+  /usr/local/sbin/acme-orchestrate-push --dry-run
+
+Deploy:
+
+  /usr/local/sbin/acme-orchestrate-push
+
+The push command uses rsync to synchronise prepared snapshots to
+configured local or remote destinations.
+
+Each destination must already exist and must be exclusively managed
+by this software.
+
+The command uses rsync --delete.
+
+Missing destination directories require operator intervention.
+Historical destinations removed from configuration are not
+automatically cleaned up.
+
+The consuming application may need to be reloaded to use new
+certificates. This is not performed by the package.
+
+Cron
+----
+Install these entries in the indicated crontabs.
+
+acme user's crontab:
+
+  12 3 * * 1,4 /usr/local/sbin/acme-orchestrate-runner
+
+root's crontab:
+
+  12 4 * * 1,4 /usr/local/sbin/acme-orchestrate-push >> /var/log/acme-orchestrate-push.log 2>&1
+
+These run Mondays and Thursdays at 03:12 and 04:12 using the system's
+local timezone.
+
+The jobs are independent. Certificate reconciliation is performed
+first; deployment is scheduled separately.
+
+Do not schedule acme-orchestrate directly. The runner provides the
+dry-run preflight, locking and logging.
+
+Logging
+-------
+The package installs:
+
+  /usr/local/etc/newsyslog.conf.d/acme-orchestrate.conf.sample
+
+The @sample mechanism creates the active configuration:
+
+  /usr/local/etc/newsyslog.conf.d/acme-orchestrate.conf
+
+Two logs are managed:
+
+  /var/log/acme-orchestrate.log
+  /var/log/acme-orchestrate-push.log
+
+The supplied configuration uses size-based rotation at 10 MiB,
+retains ten compressed archives and supports log file creation.
+
+Check without rotating:
+
+  newsyslog -nvv
+
+Create missing configured logs:
+
+  newsyslog -CN
+
+acme.sh has its own separate newsyslog configuration.
+
+Manual operation
+----------------
+As acme:
+
+  acme-orchestrate --dry-run
+  acme-orchestrate
+  acme-orchestrate --staging --dry-run
+
+As root:
+
+  acme-orchestrate-push --dry-run
+  acme-orchestrate-push
+
+Review all proposed changes before live operations.
+
+Security and backups
+--------------------
+Do not import production private keys, certificates, TSIG secrets,
+ACME account credentials or deployment state into the Git repository
+or published package.
+
+Back up operational state and credentials separately using
+appropriate ownership, permissions and storage protection.
+
+Do not configure independent production orchestrators without
+coordinating issuance, renewal schedules and certificate state.
+

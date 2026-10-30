@@ -1,0 +1,339 @@
+
+#!/bin/sh
+#
+# acme-orchestrate-push
+#
+# Distribute validated ACME deployment snapshots to configured replicas.
+# FreeBSD /bin/sh. Intended to run as root.
+#
+# The existing per-replica locks are shared with acme-orchestrate.
+#
+
+set -eu
+umask 077
+
+
+# Deployment requires root privileges.
+if [ "$(id -u)" -ne 0 ]; then
+    printf 'acme-orchestrate-push: ERROR: must run as root\n' >&2
+    exit 1
+fi
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+CONFIG=${ACME_DOMAINS_CONF:-/usr/local/etc/acme/domains.conf}
+DEPLOY=${ACME_STATE_DIR:-/var/db/acme}/deployment
+
+DRY=0
+
+case "${1:-}" in
+    --dry-run)
+        [ "$#" -eq 1 ] || exit 2
+        DRY=1
+        shift
+        ;;
+esac
+
+log() {
+    printf 'acme-orchestrate-push: %s\n' "$*"
+}
+
+error() {
+    printf 'acme-orchestrate-push: ERROR: %s\n' "$*" >&2
+}
+
+
+# Internal worker, invoked only while holding the replica lock.
+case "${1:-}" in
+    --push|--preview)
+        [ "$#" -eq 3 ] || exit 2
+
+        worker_mode=$1
+
+        id=$2
+        destination=$3
+        source=$DEPLOY/$id
+
+        case "$id" in
+            ''|*[!A-Za-z0-9_-]*)
+                error "invalid replica identifier"
+                exit 2
+                ;;
+        esac
+
+        [ ! -L "$source" ] || {
+            error "$id is a symbolic link"
+            exit 1
+        }
+
+        # Readiness must be checked while the lock is held.
+        if [ ! -d "$source" ] || [ -L "$source" ]; then
+            error "$id: replica directory missing or unsafe: $source"
+            exit 1
+        fi
+
+        if [ ! -f "$source/$id.ready" ] ||
+           [ -L "$source/$id.ready" ]; then
+            error "$id: replica is not ready (missing or unsafe readiness marker)"
+            exit 1
+        fi
+
+        if [ "$worker_mode" = --preview ]; then
+            log "$id: previewing synchronisation to $destination"
+            rsync_dry=-n
+        else
+            log "$id: synchronising to $destination"
+            rsync_dry=
+        fi
+
+        case "$destination" in
+            /*)
+                # Local destination: no SSH required.
+                if rsync $rsync_dry -ai --chown=root:wheel --delete \
+                    --exclude="/$id.ready" \
+                    "$source/" "$destination"; then
+                    if [ "$worker_mode" = --preview ]; then
+                        log "$id: preview successful (no changes made)"
+                    else
+                        log "$id: synchronisation successful"
+                    fi
+                    exit 0
+                else
+                    rc=$?
+                    error "$id: synchronisation failed (exit $rc)"
+                    exit "$rc"
+                fi
+                ;;
+            *)
+                # Remote destination: use SSH.
+                if rsync $rsync_dry -ai --chown=root:wheel -e ssh --delete \
+                    --exclude="/$id.ready" \
+                    "$source/" "$destination"; then
+                    if [ "$worker_mode" = --preview ]; then
+                        log "$id: preview successful (no changes made)"
+                    else
+                        log "$id: synchronisation successful"
+                    fi
+                    exit 0
+                else
+                    rc=$?
+                    error "$id: synchronisation failed (exit $rc)"
+                    exit "$rc"
+                fi
+                ;;
+        esac
+
+        # End of the --push worker.
+        ;;
+esac
+
+case "${1:-}" in
+    '') ;;
+    *) error "Usage: $0"; exit 2 ;;
+esac
+
+log "started at $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+if [ "$DRY" -eq 1 ]; then
+    log "mode: dry-run (no transfers will be performed)"
+else
+    log "mode: live"
+fi
+
+[ -r "$CONFIG" ] || {
+    error "cannot read $CONFIG"
+    exit 1
+}
+
+[ -d "$DEPLOY" ] || {
+    error "deployment directory missing: $DEPLOY"
+    exit 1
+}
+
+for utility in awk rsync ssh lockf mktemp; do
+    command -v "$utility" >/dev/null 2>&1 || {
+        error "required utility unavailable: $utility"
+        exit 1
+    }
+done
+
+# Parse configuration without evaluating shell expressions.
+# Only replicas referenced by at least one certificate are selected.
+#
+# Validate the entire configuration before starting any rsync.
+
+replicas=$(mktemp /tmp/acme-push.XXXXXXXX) || exit 1
+
+trap 'rm -f "$replicas"' EXIT
+trap 'exit 1' HUP INT TERM
+
+if ! awk '
+function trim(s) {
+    sub(/^[ \t]+/, "", s)
+    sub(/[ \t]+$/, "", s)
+    return s
+}
+
+function bad(s) {
+    printf "domains.conf:%d: %s\n", NR, s > "/dev/stderr"
+    failed=1
+}
+
+{
+    line=$0
+    sub(/\r$/, "", line)
+    line=trim(line)
+
+    if(line=="" || line ~ /^#/)
+        next
+
+    if(line ~ /^\$/) {
+        n=split(line,a,"=")
+
+        if(n!=2) {
+            bad("invalid replica alias definition")
+            next
+        }
+
+        name=trim(a[1])
+        target=trim(a[2])
+        id=substr(name,2)
+
+        if(name !~ /^\$[A-Za-z][A-Za-z0-9_-]*$/) {
+            bad("invalid replica alias")
+            next
+        }
+
+        if(id in destinations) {
+            bad("duplicate replica alias " name)
+            next
+        }
+
+        if(target !~ /^\/[A-Za-z0-9_.\/-]+\/$/ &&
+           target !~ /^([A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*:\/[A-Za-z0-9_.\/-]+\/$/) {
+            bad("invalid destination for " name)
+            next
+        }
+
+        if(target ~ /\/\.\.\//) {
+            bad("unsafe destination for " name)
+            next
+        }
+
+        if(target in destinationseen) {
+            bad("replica destination " target \
+                " already assigned to $" destinationseen[target])
+            next
+        }
+
+        destinationseen[target]=id
+
+        destinations[id]=target
+        order[++count]=id
+        next
+    }
+
+    n=split(line,a,":")
+
+    if(n!=5) {
+        bad("invalid certificate definition")
+        next
+    }
+
+    replicas=trim(a[3])
+
+    if(replicas=="") {
+        bad("certificate has no replicas")
+        next
+    }
+
+    n=split(replicas,r,",")
+
+    for(i=1;i<=n;i++) {
+        name=trim(r[i])
+        id=substr(name,2)
+
+        if(name !~ /^\$[A-Za-z][A-Za-z0-9_-]*$/) {
+            bad("invalid replica reference " name)
+            continue
+        }
+
+        if(!(id in destinations)) {
+            bad("undefined replica alias " name)
+            continue
+        }
+
+        used[id]=1
+    }
+}
+
+END {
+    if(failed)
+        exit 1
+
+    for(i=1;i<=count;i++) {
+        id=order[i]
+        if(id in used)
+            print id "|" destinations[id]
+    }
+}
+' "$CONFIG" > "$replicas"; then
+    error "configuration invalid; no transfers attempted"
+    exit 1
+fi
+
+[ -s "$replicas" ] || {
+    error "no configured replicas"
+    exit 1
+}
+
+# Process each configured replica independently.
+# A failure does not prevent other replicas being attempted.
+
+failures=0
+transferred=0
+
+while IFS='|' read -r id destination; do
+    source=$DEPLOY/$id
+    lock=$DEPLOY/$id.lock
+
+    # Preliminary readiness check avoids unnecessary locking.
+    # A configured replica that is missing or unready is an error.
+    if [ ! -d "$source" ] || [ -L "$source" ]; then
+        error "$id: replica directory missing or unsafe: $source"
+        failures=$((failures + 1))
+        continue
+    fi
+
+    if [ ! -f "$source/$id.ready" ] ||
+       [ -L "$source/$id.ready" ]; then
+        error "$id: replica is not ready (missing or unsafe readiness marker)"
+        failures=$((failures + 1))
+        continue
+    fi
+
+    # Match the orchestrator's existing per-replica lock.
+    # Recheck readiness in the locked worker.
+    : >> "$lock"
+
+    if [ "$DRY" -eq 1 ]; then
+        worker_action=--preview
+    else
+        worker_action=--push
+    fi
+
+    if lockf -k "$lock" \
+        /bin/sh "$0" "$worker_action" "$id" "$destination"; then
+        transferred=$((transferred + 1))
+    else
+        error "$id: deployment unsuccessful"
+        failures=$((failures + 1))
+    fi
+
+done < "$replicas"
+
+log "completed at $(date '+%Y-%m-%d %H:%M:%S %Z'): $transferred successful, $failures failed"
+
+[ "$failures" -eq 0 ]
+

@@ -1,0 +1,8 @@
+sbin/acme-orchestrate
+sbin/acme-orchestrate-push
+sbin/acme-orchestrate-runner
+share/acme-orchestrate/dns_nsupdate.sh
+etc/acme/domains.conf.sample
+%%DOCSDIR%%/README.install
+@sample etc/newsyslog.conf.d/acme-orchestrate.conf.sample
+@sample etc/acme/orchestrate.conf.sample

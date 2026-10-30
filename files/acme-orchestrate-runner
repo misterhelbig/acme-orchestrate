@@ -1,0 +1,118 @@
+
+#!/bin/sh
+#
+# acme-orchestrate-runner
+#
+# Cron entry point for certificate reconciliation and deployment staging.
+# FreeBSD /bin/sh.
+#
+# Run as: acme
+#
+# Operations:
+#   1. Acquire an exclusive runner lock.
+#   2. Log start time.
+#   3. Run acme-orchestrate --dry-run.
+#   4. Abort if pre-flight validation fails.
+#   5. Run acme-orchestrate.
+#   6. Log completion time and exit status.
+#
+# All stdout and stderr are appended to one log.
+#
+
+set -u
+umask 027
+
+# Certificate management must run as the dedicated acme user.
+if [ "$(id -un)" != acme ]; then
+    echo "ERROR: acme-orchestrate-runner must run as acme" >&2
+    exit 1
+fi
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+ORCHESTRATE=/usr/local/sbin/acme-orchestrate
+LOCK=/var/db/acme/orchestrate-runner.lock
+LOG=/var/log/acme-orchestrate.log
+
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S %Z'
+}
+
+separator() {
+    printf '%s\n' \
+        '========================================================================'
+}
+
+# The outer invocation obtains a non-blocking lock.
+# The actual work runs in a child process holding that lock.
+#
+# This is distinct from orchestrate.lock, which is acquired
+# internally by acme-orchestrate during live reconciliation.
+case "${1:-}" in
+    '')
+        exec /usr/bin/lockf -t 0 "$LOCK" \
+            /bin/sh "$0" --locked
+        ;;
+
+    --locked)
+        ;;
+
+    *)
+        echo "Usage: $0" >&2
+        exit 2
+        ;;
+esac
+
+# From this point, execution is protected by the runner lock.
+
+if [ ! -x "$ORCHESTRATE" ]; then
+    echo "ERROR: orchestrator not executable: $ORCHESTRATE" >&2
+    exit 1
+fi
+
+if [ ! -d "${LOG%/*}" ]; then
+    echo "ERROR: log directory does not exist: ${LOG%/*}" >&2
+    exit 1
+fi
+
+# Capture all output, including that produced by acme.sh.
+exec >> "$LOG" 2>&1 || exit 1
+
+separator
+printf '%s - ACME orchestration started (PID %s)\n' \
+    "$(timestamp)" "$$"
+separator
+
+printf '\n--- PRE-FLIGHT DRY RUN ---\n\n'
+
+if "$ORCHESTRATE" --dry-run; then
+    printf '\n%s - Pre-flight validation passed\n' "$(timestamp)"
+else
+    rc=$?
+
+    printf '\n%s - Pre-flight validation FAILED (exit %s)\n' \
+        "$(timestamp)" "$rc"
+
+    separator
+    exit "$rc"
+fi
+
+printf '\n--- LIVE RECONCILIATION ---\n\n'
+
+if "$ORCHESTRATE"; then
+    printf '\n%s - Reconciliation completed successfully\n' \
+        "$(timestamp)"
+
+    separator
+    exit 0
+else
+    rc=$?
+
+    printf '\n%s - Reconciliation FAILED (exit %s)\n' \
+        "$(timestamp)" "$rc"
+
+    separator
+    exit "$rc"
+fi
+

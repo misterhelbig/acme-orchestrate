@@ -1,0 +1,8 @@
+# Example only. Supply your own delegated DNS challenge aliases and destinations.
+# Replica destinations MUST be dedicated to acme-orchestrate: rsync uses --delete.
+$web = root@web-host:/usr/local/etc/apache24/ssl/acme/
+$local = /usr/local/etc/ssl/acme/
+
+# parent-domain: challenge-alias: replicas: apex: SANs
+example.net:    example-net:     $web:      apex: *
+example.net:    vpn-example-net: $local:    none: vpn

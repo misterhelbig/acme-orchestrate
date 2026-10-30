@@ -1,0 +1,39 @@
+ACME certificate orchestration for FreeBSD, using acme.sh and DNS-01
+validation through nsupdate.
+
+Three commands are provided:
+
+acme-orchestrate
+    Run as user 'acme'. Reconciles certificate definitions, issues
+    or renews certificates, and prepares validated replica snapshots.
+    Normally invoked by acme-orchestrate-runner, not directly by cron.
+
+acme-orchestrate-runner
+    Run as user 'acme'. Scheduled wrapper that performs preflight
+    validation, certificate reconciliation, locking and logging.
+    Install in the 'acme' user's crontab.
+
+acme-orchestrate-push
+    Run as root. Deploys prepared certificate snapshots to configured
+    local or remote destinations using rsync.
+    Install in root's crontab.
+
+Example crontab entries:
+
+    # acme user's crontab
+    12 3 * * 1,4 /usr/local/sbin/acme-orchestrate-runner
+
+    # root's crontab
+    12 4 * * 1,4 /usr/local/sbin/acme-orchestrate-push >> /var/log/acme-orchestrate-push.log 2>&1
+
+These examples run on Mondays and Thursdays. Reconciliation starts at
+03:12 and deployment at 04:12, using the server's local timezone.
+The jobs run independently; deployment uses the latest prepared
+snapshots. Adjust the schedule as required.
+
+The package installs scripts, examples and newsyslog configuration.
+It does not configure certificate definitions, DNS credentials,
+cron jobs, or production certificate state.
+
+Project: https://github.com/misterhelbig/acme-orchestrate
+

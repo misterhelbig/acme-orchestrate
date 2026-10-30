@@ -1,0 +1,11 @@
+*.pkg
+work/
+packages/
+*.log
+*.key
+*.pem
+*.cer
+*.conf.local
+*.tsig
+*.secret
+releases/

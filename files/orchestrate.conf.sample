@@ -1,0 +1,10 @@
+# ACME DNS-01 challenge zone.
+#
+# Certificate challenge aliases are created beneath this zone.
+# The authoritative zone must support authenticated nsupdate.
+#
+# Example:
+# _acme-challenge.bar.net. IN CNAME
+#     _acme-challenge.bar-net.acme.example.net.
+
+ACME_CHALLENGE_ZONE='acme.example.net'
